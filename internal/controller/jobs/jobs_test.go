@@ -54,6 +54,7 @@ func TestBuildTalosctlPodSpec_SecurityPolicy(t *testing.T) {
 		{"ReadOnlyRootFilesystem", *spec.Containers[0].SecurityContext.ReadOnlyRootFilesystem, true},
 		{"CapDrop", spec.Containers[0].SecurityContext.Capabilities.Drop[0], corev1.Capability("ALL")},
 		{"TolerationOp", spec.Tolerations[0].Operator, corev1.TolerationOpExists},
+		{"NodeSelectorOS", spec.NodeSelector[corev1.LabelOSStable], "linux"},
 		{"CPURequest", spec.Containers[0].Resources.Requests.Cpu().Cmp(resource.MustParse("10m")), 0},
 		{"MemoryRequest", spec.Containers[0].Resources.Requests.Memory().Cmp(resource.MustParse("64Mi")), 0},
 		{"MemoryLimit", spec.Containers[0].Resources.Limits.Memory().Cmp(resource.MustParse("512Mi")), 0},

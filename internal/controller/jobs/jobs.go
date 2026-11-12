@@ -53,6 +53,10 @@ func BuildTalosctlPodSpec(opts PodSpecOptions) corev1.PodSpec {
 				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			},
 		},
+		// The toleration lets the pod onto any tainted node, so this keeps it
+		// off nodes that can't run the Linux talosctl image, such as virtual
+		// kubelets.
+		NodeSelector: map[string]string{corev1.LabelOSStable: "linux"},
 		Tolerations: []corev1.Toleration{
 			{
 				Operator: corev1.TolerationOpExists,
