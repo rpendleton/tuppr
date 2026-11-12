@@ -3,13 +3,13 @@ package kubernetesupgrade
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tupprv1alpha1 "github.com/home-operations/tuppr/api/v1alpha1"
@@ -58,7 +58,7 @@ func (r *Reconciler) processUpgrade(ctx context.Context, kubernetesUpgrade *tupp
 			return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
 		}
 		targetVersion := kubernetesUpgrade.Spec.Kubernetes.Version
-		allUpgraded, err := r.areAllNodesUpgraded(ctx, targetVersion)
+		allUpgraded, err := r.areAllNodesUpgraded(ctx, kubernetesUpgrade.Spec.NodeSelector, targetVersion)
 		if err != nil {
 			return r.reportReconcileError(ctx, kubernetesUpgrade, upgradeaudit.ReasonCheckNodeVersions, "re-check node versions", time.Minute*5, err), nil
 		}
@@ -122,7 +122,7 @@ func (r *Reconciler) processUpgrade(ctx context.Context, kubernetesUpgrade *tupp
 		}
 	}
 
-	allUpgraded, err := r.areAllNodesUpgraded(ctx, targetVersion)
+	allUpgraded, err := r.areAllNodesUpgraded(ctx, kubernetesUpgrade.Spec.NodeSelector, targetVersion)
 	if err != nil {
 		return r.reportReconcileError(ctx, kubernetesUpgrade, upgradeaudit.ReasonCheckNodeVersions, "check node versions", time.Minute, err), nil
 	}
@@ -251,7 +251,7 @@ func (r *Reconciler) startUpgrade(ctx context.Context, kubernetesUpgrade *tupprv
 	logger := log.FromContext(ctx)
 
 	targetVersion := kubernetesUpgrade.Spec.Kubernetes.Version
-	controllerNode, controllerIP, err := r.findControllerNode(ctx, targetVersion)
+	controllerNode, controllerIP, err := r.findControllerNode(ctx, kubernetesUpgrade.Spec.NodeSelector, targetVersion)
 	if err != nil {
 		logger.Error(err, "Failed to find controller node", "targetVersion", targetVersion)
 		if err := r.setPhase(ctx, kubernetesUpgrade, tupprv1alpha1.JobPhaseFailed, "", fmt.Sprintf("Failed to find controller node: %s", err.Error())); err != nil {
@@ -283,15 +283,15 @@ func (r *Reconciler) startUpgrade(ctx context.Context, kubernetesUpgrade *tupprv
 	return ctrl.Result{RequeueAfter: time.Second * 30}, nil
 }
 
-func (r *Reconciler) findControllerNode(ctx context.Context, targetVersion string) (string, string, error) {
-	nodeList := &corev1.NodeList{}
-	if err := r.List(ctx, nodeList); err != nil {
-		return "", "", fmt.Errorf("failed to list nodes: %w", err)
+func (r *Reconciler) findControllerNode(ctx context.Context, nodeSelector *metav1.LabelSelector, targetVersion string) (string, string, error) {
+	nodes, err := nodeutil.ListSelectedNodes(ctx, r.Client, nodeSelector)
+	if err != nil {
+		return "", "", err
 	}
 
 	var fallbackName, fallbackIP string
-	for _, node := range nodeList.Items {
-		if _, isController := node.Labels["node-role.kubernetes.io/control-plane"]; !isController {
+	for _, node := range nodes {
+		if !isControlPlane(&node) {
 			continue
 		}
 		nodeIP, err := nodeutil.GetNodeIP(&node)
@@ -314,21 +314,18 @@ func (r *Reconciler) findControllerNode(ctx context.Context, targetVersion strin
 	return "", "", fmt.Errorf("no controller node found with node-role.kubernetes.io/control-plane label")
 }
 
-func (r *Reconciler) areAllControlPlaneNodesUpgraded(ctx context.Context, targetVersion string) (bool, error) {
-	nodeList := &corev1.NodeList{}
-	opts := []client.ListOption{
-		client.MatchingLabels{"node-role.kubernetes.io/control-plane": ""},
+func (r *Reconciler) areAllControlPlaneNodesUpgraded(ctx context.Context, nodeSelector *metav1.LabelSelector, targetVersion string) (bool, error) {
+	nodes, err := nodeutil.ListSelectedNodes(ctx, r.Client, nodeSelector)
+	if err != nil {
+		return false, err
 	}
+	nodes = slices.DeleteFunc(nodes, func(node corev1.Node) bool { return !isControlPlane(&node) })
 
-	if err := r.List(ctx, nodeList, opts...); err != nil {
-		return false, fmt.Errorf("failed to list control plane nodes: %w", err)
-	}
-
-	if len(nodeList.Items) == 0 {
+	if len(nodes) == 0 {
 		return false, fmt.Errorf("no control plane nodes found")
 	}
 
-	for _, node := range nodeList.Items {
+	for _, node := range nodes {
 		if node.Status.NodeInfo.KubeletVersion != targetVersion {
 			log.FromContext(ctx).V(1).Info("Control plane node not yet upgraded",
 				"node", node.Name,
@@ -341,17 +338,17 @@ func (r *Reconciler) areAllControlPlaneNodesUpgraded(ctx context.Context, target
 	return true, nil
 }
 
-func (r *Reconciler) areAllNodesUpgraded(ctx context.Context, targetVersion string) (bool, error) {
-	nodeList := &corev1.NodeList{}
-	if err := r.List(ctx, nodeList); err != nil {
-		return false, fmt.Errorf("failed to list nodes: %w", err)
+func (r *Reconciler) areAllNodesUpgraded(ctx context.Context, nodeSelector *metav1.LabelSelector, targetVersion string) (bool, error) {
+	nodes, err := nodeutil.ListSelectedNodes(ctx, r.Client, nodeSelector)
+	if err != nil {
+		return false, err
 	}
 
-	if len(nodeList.Items) == 0 {
+	if len(nodes) == 0 {
 		return false, fmt.Errorf("no nodes found")
 	}
 
-	for _, node := range nodeList.Items {
+	for _, node := range nodes {
 		current := node.Status.NodeInfo.KubeletVersion
 		// Empty means kubelet has not reported yet (e.g. Node just registered).
 		// Skip rather than trigger a false drift; the hourly requeue re-checks.
@@ -368,4 +365,9 @@ func (r *Reconciler) areAllNodesUpgraded(ctx context.Context, targetVersion stri
 	}
 
 	return true, nil
+}
+
+func isControlPlane(node *corev1.Node) bool {
+	_, ok := node.Labels["node-role.kubernetes.io/control-plane"]
+	return ok
 }

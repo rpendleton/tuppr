@@ -1081,7 +1081,7 @@ func TestK8sFindControllerNode(t *testing.T) {
 
 	r := newK8sReconciler(cl, &mockVersionGetter{}, &mockTalosClient{}, &mockHealthChecker{})
 
-	name, ip, err := r.findControllerNode(context.Background(), testK8sVersion)
+	name, ip, err := r.findControllerNode(context.Background(), nil, testK8sVersion)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1097,7 +1097,7 @@ func TestK8sFindControllerNode_NoControlPlane(t *testing.T) {
 		WithObjects(newWorkerNode("10.0.0.2")).Build()
 	r := newK8sReconciler(cl, &mockVersionGetter{}, &mockTalosClient{}, &mockHealthChecker{})
 
-	_, _, err := r.findControllerNode(context.Background(), testK8sVersion)
+	_, _, err := r.findControllerNode(context.Background(), nil, testK8sVersion)
 	if err == nil {
 		t.Fatal("expected error when no control-plane node")
 	}
@@ -1376,6 +1376,75 @@ func TestK8sReconcile_CompletedReentersOnLaggingWorker(t *testing.T) {
 	}
 }
 
+func withK8sNodeSelector(matchLabels map[string]string) func(*tupprv1alpha1.KubernetesUpgrade) {
+	return func(ku *tupprv1alpha1.KubernetesUpgrade) {
+		ku.Spec.NodeSelector = &metav1.LabelSelector{MatchLabels: matchLabels}
+	}
+}
+
+func withNodeLabel(n *corev1.Node, key, value string) *corev1.Node {
+	if n.Labels == nil {
+		n.Labels = map[string]string{}
+	}
+	n.Labels[key] = value
+	return n
+}
+
+func TestK8sReconcile_CompletedIgnoresLaggingNodeOutsideSelector(t *testing.T) {
+	scheme := newTestScheme()
+	ku := newKubernetesUpgrade("test-upgrade",
+		withK8sFinalizer,
+		withK8sPhase(tupprv1alpha1.JobPhaseCompleted),
+		withK8sNodeSelector(map[string]string{"kubernetes.io/os": "linux"}),
+	)
+	cpAtTarget := withNodeLabel(newControllerNodeWithVersion("ctrl-1", testNodeIP, testK8sVersion), "kubernetes.io/os", "linux")
+	virtualKubelet := withNodeLabel(newLaggingWorkerNode("10.0.0.5"), "kubernetes.io/os", "darwin")
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(ku, cpAtTarget, virtualKubelet).WithStatusSubresource(ku).Build()
+	r := newK8sReconciler(cl, &mockVersionGetter{version: testK8sVersion}, &mockTalosClient{}, &mockHealthChecker{})
+
+	result := reconcileK8s(t, r, "test-upgrade")
+	if result.RequeueAfter != time.Hour {
+		t.Fatalf("expected 1h requeue when only an unselected node lags, got: %v", result.RequeueAfter)
+	}
+
+	updated := getK8sUpgrade(t, cl, "test-upgrade")
+	if updated.Status.Phase != tupprv1alpha1.JobPhaseCompleted {
+		t.Fatalf("expected phase to remain Completed, got: %s", updated.Status.Phase)
+	}
+}
+
+func TestK8sFindControllerNode_RespectsNodeSelector(t *testing.T) {
+	scheme := newTestScheme()
+	excluded := newControllerNodeWithVersion("ctrl-1", testNodeIP, testV1330)
+	selected := withNodeLabel(newControllerNodeWithVersion("ctrl-selected", "10.0.0.3", testV1330), "tuppr.home-operations.com/upgrade", "enabled")
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(excluded, selected).Build()
+	r := newK8sReconciler(cl, &mockVersionGetter{}, &mockTalosClient{}, &mockHealthChecker{})
+
+	selector := &metav1.LabelSelector{MatchLabels: map[string]string{"tuppr.home-operations.com/upgrade": "enabled"}}
+	name, _, err := r.findControllerNode(context.Background(), selector, testK8sVersion)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "ctrl-selected" {
+		t.Fatalf("expected the selected control plane node, got: %s", name)
+	}
+}
+
+func TestK8sAreAllControlPlaneNodesUpgraded_NoneSelected(t *testing.T) {
+	scheme := newTestScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(newControllerNodeWithVersion("ctrl-1", testNodeIP, testK8sVersion)).Build()
+	r := newK8sReconciler(cl, &mockVersionGetter{}, &mockTalosClient{}, &mockHealthChecker{})
+
+	selector := &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/os": "linux"}}
+	if _, err := r.areAllControlPlaneNodesUpgraded(context.Background(), selector, testK8sVersion); err == nil {
+		t.Fatal("expected error when the selector matches no control plane node")
+	}
+}
+
 func TestK8sReconcile_PendingFromLaggingWorkerStartsUpgrade(t *testing.T) {
 	scheme := newTestScheme()
 	ku := newKubernetesUpgrade("test-upgrade",
@@ -1496,7 +1565,7 @@ func TestK8sFindControllerNode_FallbackWhenAllControlPlanesAtTarget(t *testing.T
 		WithObjects(cpAtTarget, workerLagging).Build()
 	r := newK8sReconciler(cl, &mockVersionGetter{}, &mockTalosClient{}, &mockHealthChecker{})
 
-	name, ip, err := r.findControllerNode(context.Background(), testK8sVersion)
+	name, ip, err := r.findControllerNode(context.Background(), nil, testK8sVersion)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	tupprv1alpha1 "github.com/home-operations/tuppr/api/v1alpha1"
+	"github.com/home-operations/tuppr/internal/controller/nodeutil"
 	"github.com/home-operations/tuppr/internal/webhook/validation"
 )
 
@@ -78,6 +79,10 @@ func (v *Validator) validate(ctx context.Context, k *tupprv1alpha1.KubernetesUpg
 
 	if err := validation.ValidateVersionFormat(k.Spec.Kubernetes.Version); err != nil {
 		return warnings, fmt.Errorf("invalid kubernetes version: %w", err)
+	}
+
+	if _, err := nodeutil.ParseNodeSelector(k.Spec.NodeSelector); err != nil {
+		return warnings, err
 	}
 
 	if err := validation.ValidateHealthChecks(k.Spec.HealthChecks); err != nil {

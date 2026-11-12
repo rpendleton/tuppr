@@ -210,8 +210,16 @@ func (r *InventoryRefresher) refreshNodeTargets(logger logr.Logger, nodes []core
 		if version == "" {
 			continue
 		}
+		selector, err := selectorFor(ku.Spec.NodeSelector)
+		if err != nil {
+			logger.Error(err, "skipping KubernetesUpgrade for target metric", "name", ku.Name)
+			continue
+		}
 		for j := range nodes {
 			n := &nodes[j]
+			if !selector.Matches(k8slabel.Set(n.Labels)) {
+				continue
+			}
 			targets = append(targets, NodeTargetSnapshot{
 				Node:        n.Name,
 				Role:        nodeRole(n),

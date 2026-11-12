@@ -62,7 +62,7 @@ func (r *Reconciler) handleJobSuccess(ctx context.Context, kubernetesUpgrade *tu
 	nodeName := job.Labels[targetNodeLabelKey]
 	targetVersion := kubernetesUpgrade.Spec.Kubernetes.Version
 
-	allUpgraded, err := r.areAllControlPlaneNodesUpgraded(ctx, targetVersion)
+	allUpgraded, err := r.areAllControlPlaneNodesUpgraded(ctx, kubernetesUpgrade.Spec.NodeSelector, targetVersion)
 	if err != nil {
 		logger.Error(err, "Failed to verify Kubernetes upgrade, requeueing")
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil

@@ -42,6 +42,14 @@ type KubernetesUpgradeSpec struct {
 	// Maintenance configuration behavior for upgrade operations
 	// +optional
 	Maintenance *MaintenanceSpec `json:"maintenance,omitempty"`
+
+	// NodeSelector limits the upgrade to the nodes it matches: they hold the
+	// control plane node the upgrade runs against, and their kubelet versions
+	// decide when it is complete. Nodes it doesn't match, such as virtual
+	// kubelets that don't run the cluster's Kubernetes version, are ignored.
+	// Without a selector, every node is included.
+	// +optional
+	NodeSelector *metav1.LabelSelector `json:"nodeSelector,omitempty"`
 }
 
 // KubernetesUpgradeStatus defines the observed state of KubernetesUpgrade

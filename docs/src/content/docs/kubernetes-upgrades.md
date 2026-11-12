@@ -35,6 +35,22 @@ The optional fields - [health checks](/talos-upgrades/#health-checks),
 [`talosctl` image](/talos-upgrades/#talosctl-image) - work exactly as they do
 for a Talos upgrade.
 
+## Node selection
+
+An upgrade is complete once every node's kubelet reports the target version.
+Use `spec.nodeSelector` (a standard label selector) to leave out nodes that
+never will, such as virtual kubelets:
+
+```yaml
+spec:
+  nodeSelector:
+    matchLabels:
+      kubernetes.io/os: linux
+```
+
+The selector also limits which control plane node the upgrade runs against, so
+it has to match at least one.
+
 ## One per cluster
 
 A Kubernetes upgrade is cluster-wide, so the admission webhook allows only one

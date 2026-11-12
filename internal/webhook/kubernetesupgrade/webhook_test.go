@@ -9,6 +9,7 @@ import (
 
 	tupprv1alpha1 "github.com/home-operations/tuppr/api/v1alpha1"
 	"github.com/home-operations/tuppr/internal/constants"
+	"github.com/home-operations/tuppr/internal/controller/nodeutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -469,6 +470,39 @@ func TestKubernetesUpgrade_ValidateCreate_InvalidPullPolicy(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid") {
 		t.Errorf("expected error to mention 'invalid', got: %v", err)
+	}
+}
+
+func TestKubernetesUpgrade_ValidateCreate_NodeSelector(t *testing.T) {
+	tests := []struct {
+		name     string
+		selector *metav1.LabelSelector
+		wantErr  bool
+	}{
+		{name: "unset", selector: nil},
+		{name: "valid", selector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/os": "linux"}}},
+		{
+			name: "In without values",
+			selector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "kubernetes.io/os", Operator: metav1.LabelSelectorOpIn},
+			}},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := newK8sValidator(talosConfigSecret(testNamespace, validTalosConfig()))
+			ku := newKubernetesUpgrade("test")
+			ku.Spec.NodeSelector = tt.selector
+
+			_, err := v.ValidateCreate(context.Background(), ku)
+			if tt.wantErr && !errors.Is(err, nodeutil.ErrInvalidNodeSelector) {
+				t.Fatalf("expected ErrInvalidNodeSelector, got: %v", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+		})
 	}
 }
 
