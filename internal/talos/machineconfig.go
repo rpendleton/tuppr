@@ -5,10 +5,10 @@ package talos
 // A node's machine config can carry document kinds newer than any machinery this
 // binary links (a 1.13 tuppr meeting 1.14's DiscoveryIdentityConfig or
 // BGPPeerConfig), and machinery's decoder hard-errors on unknown kinds.
-// Reading and patching the install image therefore never decodes the whole
-// config: documents are split textually, only the two kinds that can carry an
-// install image are parsed, and every other document passes through byte for
-// byte.
+// Reading and patching the install or kubelet image therefore never decodes
+// the whole config: documents are split textually, only the kinds that can
+// carry the image are parsed, and every other document passes through byte
+// for byte.
 
 import (
 	"fmt"
@@ -21,6 +21,11 @@ import (
 // Its presence also means the v1alpha1 .machine.install section is rejected by
 // the node, so it decides which document a patch may touch.
 const unattendedInstallKind = "UnattendedInstallConfig"
+
+// v1alpha1Version marks the legacy document, which has a version and no kind.
+const v1alpha1Version = "v1alpha1"
+
+const imageKey = "image"
 
 // splitDocuments splits a multi-document YAML stream on standalone `---`
 // separator lines, dropping empty segments and preserving each document's text.
@@ -81,7 +86,7 @@ func installImageFromConfig(raw string) (string, error) {
 			if ui.Installer.Image != "" {
 				return ui.Installer.Image, nil
 			}
-		case probe.Kind == "" && probe.Version == "v1alpha1":
+		case probe.Kind == "" && probe.Version == v1alpha1Version:
 			var v1 v1alpha1InstallDoc
 			if err := yaml.Unmarshal([]byte(doc), &v1); err != nil {
 				return "", fmt.Errorf("failed to parse v1alpha1 document: %w", err)
@@ -108,16 +113,22 @@ func setInstallImage(raw, image string) (string, error) {
 	for i, doc := range docs {
 		switch probe := probeDocument(doc); {
 		case probe.Kind == unattendedInstallKind:
-			target, path = i, []string{"installer", "image"}
-		case probe.Kind == "" && probe.Version == "v1alpha1" && target == -1:
-			target, path = i, []string{"machine", "install", "image"}
+			target, path = i, []string{"installer", imageKey}
+		case probe.Kind == "" && probe.Version == v1alpha1Version && target == -1:
+			target, path = i, []string{"machine", "install", imageKey}
 		}
 	}
 	if target == -1 {
 		return "", fmt.Errorf("no document owns the install image in the machine config")
 	}
 
-	edited, err := setYAMLPath(docs[target], path, image)
+	return setDocumentValue(docs, target, path, image)
+}
+
+// setDocumentValue sets a scalar at path in docs[target] and joins the stream
+// back together, every other document unchanged.
+func setDocumentValue(docs []string, target int, path []string, value string) (string, error) {
+	edited, err := setYAMLPath(docs[target], path, value)
 	if err != nil {
 		return "", err
 	}
@@ -129,6 +140,76 @@ func setInstallImage(raw, image string) (string, error) {
 	docs[target] = edited
 
 	return strings.Join(docs, "\n---\n"), nil
+}
+
+// kubeletConfigKind is the multi-document kubelet config. A node carrying it
+// rejects a v1alpha1 .machine.kubelet section, so it owns the kubelet image
+// whenever present, as Talos's own kubelet upgrade decides.
+const kubeletConfigKind = "KubeletConfig"
+
+// kubeletImageOwner returns the index of the document that owns the kubelet
+// image and the image's path inside it, or -1 when no document can.
+func kubeletImageOwner(docs []string) (int, []string) {
+	target := -1
+	var path []string
+	for i, doc := range docs {
+		switch probe := probeDocument(doc); {
+		case probe.Kind == kubeletConfigKind:
+			return i, []string{imageKey}
+		case probe.Kind == "" && probe.Version == v1alpha1Version && target == -1:
+			target, path = i, []string{"machine", "kubelet", imageKey}
+		}
+	}
+	return target, path
+}
+
+// kubeletImageFromConfig returns the kubelet image the config sets, or "" when
+// it leaves the node's default in place.
+func kubeletImageFromConfig(raw string) (string, error) {
+	docs := splitDocuments(raw)
+	target, path := kubeletImageOwner(docs)
+	if target == -1 {
+		return "", fmt.Errorf("no document owns the kubelet image in the machine config")
+	}
+
+	var node yaml.Node
+	if err := yaml.Unmarshal([]byte(docs[target]), &node); err != nil {
+		return "", fmt.Errorf("failed to parse document owning the kubelet image: %w", err)
+	}
+	if node.Kind != yaml.DocumentNode || len(node.Content) == 0 {
+		return "", nil
+	}
+	value := node.Content[0]
+	for _, key := range path {
+		value = lookupMapping(value, key)
+		if value == nil {
+			return "", nil
+		}
+	}
+	return value.Value, nil
+}
+
+// setKubeletImage returns the config with the kubelet image replaced in the
+// document that owns it, every other document unchanged.
+func setKubeletImage(raw, image string) (string, error) {
+	docs := splitDocuments(raw)
+	target, path := kubeletImageOwner(docs)
+	if target == -1 {
+		return "", fmt.Errorf("no document owns the kubelet image in the machine config")
+	}
+	return setDocumentValue(docs, target, path, image)
+}
+
+func lookupMapping(node *yaml.Node, key string) *yaml.Node {
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i < len(node.Content)-1; i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
 }
 
 // setYAMLPath sets a scalar at a mapping path inside one YAML document,

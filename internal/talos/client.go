@@ -283,6 +283,66 @@ func (s *Client) PatchNodeInstallImage(ctx context.Context, nodeIP, newImage str
 	return nil
 }
 
+// SetNodeKubeletVersion points the node's kubelet at repository:v<version>,
+// keeping a -fat or -slim tag suffix the current image carries, and applies the
+// config without a reboot, as talosctl upgrade-k8s does for each node. It
+// reports whether the config changed: false means the node already runs, or
+// is restarting onto, that image.
+func (s *Client) SetNodeKubeletVersion(ctx context.Context, nodeIP, repository, version string) (bool, error) {
+	raw, err := s.readMachineConfigRaw(ctx, nodeIP)
+	if err != nil {
+		return false, fmt.Errorf("failed to set kubelet image on node %s: %w", nodeIP, err)
+	}
+
+	current, err := kubeletImageFromConfig(raw)
+	if err != nil {
+		return false, fmt.Errorf("failed to set kubelet image on node %s: %w", nodeIP, err)
+	}
+
+	image := kubeletImage(repository, version, current)
+	if image == current {
+		return false, nil
+	}
+
+	patched, err := setKubeletImage(raw, image)
+	if err != nil {
+		return false, fmt.Errorf("failed to set kubelet image on node %s: %w", nodeIP, err)
+	}
+
+	nodeCtx := client.WithNode(ctx, nodeIP)
+
+	err = s.executeWithRetry(ctx, func() error {
+		_, err := s.talos.ApplyConfiguration(nodeCtx, &machine.ApplyConfigurationRequest{
+			Data: []byte(patched),
+			Mode: machine.ApplyConfigurationRequest_NO_REBOOT,
+		})
+		return err
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to apply configuration to node %s: %w", nodeIP, err)
+	}
+
+	return true, nil
+}
+
+// kubeletImage builds the kubelet image for version the way Talos's kubelet
+// upgrade does: the -fat and -slim variants keep their suffix.
+func kubeletImage(repository, version, current string) string {
+	tag := "v" + strings.TrimPrefix(version, "v")
+
+	ref, _, _ := strings.Cut(current, "@")
+	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
+		for _, suffix := range []string{"-fat", "-slim"} {
+			if strings.HasSuffix(ref[i+1:], suffix) {
+				tag += suffix
+				break
+			}
+		}
+	}
+
+	return repository + ":" + tag
+}
+
 // defaultPullIdleTimeout is how long a pull stream may go without progress
 // before it is failed. Long enough for manifest resolution and slow layer
 // starts; far shorter than the caller's overall pull budget.

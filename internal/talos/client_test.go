@@ -1037,3 +1037,84 @@ func TestClient_CheckEtcdHealthy_MemberListError(t *testing.T) {
 	require.ErrorContains(t, err, "failed to list etcd members from 10.0.0.1")
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
 }
+
+const (
+	testKubeletRepo    = "ghcr.io/siderolabs/kubelet"
+	testKubeletVersion = "v1.37.3"
+)
+
+func TestKubeletImageTag(t *testing.T) {
+	cases := []struct {
+		name, repository, version, current, want string
+	}{
+		{name: "plain", repository: testKubeletRepo, version: testKubeletVersion, current: "ghcr.io/siderolabs/kubelet:v1.37.2", want: testKubeletImage},
+		{name: "version without v", repository: testKubeletRepo, version: "1.37.3", current: "", want: testKubeletImage},
+		{name: "fat suffix kept", repository: testKubeletRepo, version: testKubeletVersion, current: "ghcr.io/siderolabs/kubelet:v1.37.2-fat", want: "ghcr.io/siderolabs/kubelet:v1.37.3-fat"},
+		{name: "slim suffix kept through a digest", repository: "r.example.com/kubelet", version: testKubeletVersion, current: "ghcr.io/siderolabs/kubelet:v1.37.2-slim@sha256:abcd", want: "r.example.com/kubelet:v1.37.3-slim"},
+		{name: "registry port is not a tag", repository: testKubeletRepo, version: testKubeletVersion, current: "registry:5000/kubelet-fat", want: testKubeletImage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, kubeletImage(tc.repository, tc.version, tc.current))
+		})
+	}
+}
+
+func TestClient_SetNodeKubeletVersion(t *testing.T) {
+	kubeletConfig := func(image string) string {
+		return "version: v1alpha1\nmachine:\n  type: worker\n---\napiVersion: v1alpha1\nkind: KubeletConfig\nimage: " + image + "\n"
+	}
+	cases := []struct {
+		name        string
+		raw         string
+		readErr     error
+		applyErr    error
+		wantChanged bool
+		wantApplied string
+		wantErr     string
+	}{
+		{
+			name:        "patches the owning document without a reboot",
+			raw:         kubeletConfig("ghcr.io/siderolabs/kubelet:v1.37.2-fat"),
+			wantChanged: true,
+			wantApplied: kubeletConfig("ghcr.io/siderolabs/kubelet:v1.37.3-fat"),
+		},
+		{
+			name: "already at the target image",
+			raw:  kubeletConfig("ghcr.io/siderolabs/kubelet:v1.37.3-fat"),
+		},
+		{
+			name:    "read error",
+			readErr: errors.New("connection refused"),
+			wantErr: "failed to set kubelet image",
+		},
+		{
+			name:     "apply error",
+			raw:      kubeletConfig("ghcr.io/siderolabs/kubelet:v1.37.2"),
+			applyErr: errors.New("permission denied"),
+			wantErr:  "failed to apply configuration",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &mockTalosClient{readData: tc.raw, readErr: tc.readErr, applyConfigErr: tc.applyErr}
+			c := &Client{talos: mock, newClientFunc: func(ctx context.Context) (talosClient, error) { return mock, nil }}
+
+			changed, err := c.SetNodeKubeletVersion(context.Background(), "10.0.0.1", testKubeletRepo, "v1.37.3")
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantChanged, changed)
+			if tc.wantApplied == "" {
+				assert.Nil(t, mock.applyConfigReq)
+				return
+			}
+			require.NotNil(t, mock.applyConfigReq)
+			assert.Equal(t, machine.ApplyConfigurationRequest_NO_REBOOT, mock.applyConfigReq.Mode)
+			assert.Equal(t, tc.wantApplied, string(mock.applyConfigReq.Data))
+		})
+	}
+}

@@ -3,12 +3,14 @@ package kubernetesupgrade
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -40,6 +42,17 @@ const (
 type mockTalosClient struct {
 	nodeVersions  map[string]string
 	getVersionErr error
+	kubeletErr    error
+	kubeletCalls  []kubeletCall
+}
+
+type kubeletCall struct {
+	nodeIP, repository, version string
+}
+
+func (m *mockTalosClient) SetNodeKubeletVersion(ctx context.Context, nodeIP, repository, version string) (bool, error) {
+	m.kubeletCalls = append(m.kubeletCalls, kubeletCall{nodeIP: nodeIP, repository: repository, version: version})
+	return m.kubeletErr == nil, m.kubeletErr
 }
 
 func (m *mockTalosClient) GetNodeVersion(ctx context.Context, nodeIP string) (string, error) {
@@ -1700,5 +1713,179 @@ func TestSyncMetricsFromStatusReemitsProgressing(t *testing.T) {
 	}
 	if reason != upgradeaudit.ReasonSuspended || value != 0 {
 		t.Fatalf("progressing = {reason: %s, value: %v}, want {%s, 0}", reason, value, upgradeaudit.ReasonSuspended)
+	}
+}
+
+func TestK8sReconcile_JobSuccess_KubeletsOnSelectedNodes(t *testing.T) {
+	const (
+		workerIP = "10.0.0.5"
+		macIP    = "192.168.13.10"
+	)
+	now := time.Now()
+	recent := metav1.NewTime(now.Add(-time.Minute))
+	stale := metav1.NewTime(now.Add(-kubeletUpgradeWait - time.Minute))
+	linux := map[string]string{corev1.LabelOSStable: testLinux}
+
+	newNodes := func(ctrlVersion, workerVersion string) []client.Object {
+		worker := withNodeLabel(newWorkerNode(workerIP), corev1.LabelOSStable, testLinux)
+		worker.Status.NodeInfo.KubeletVersion = workerVersion
+		mac := withNodeLabel(newLaggingWorkerNode(macIP), corev1.LabelOSStable, "darwin")
+		mac.Name = "mac-1"
+		return []client.Object{
+			// Listed ahead of the controller node, which must still go first.
+			worker,
+			withNodeLabel(newControllerNodeWithVersion(fakeCrtl, testNodeIP, ctrlVersion), corev1.LabelOSStable, testLinux),
+			mac,
+		}
+	}
+
+	cases := []struct {
+		name           string
+		selector       map[string]string
+		repository     string
+		ctrlVersion    string
+		workerVersion  string
+		completedAt    *metav1.Time
+		kubeletErr     error
+		wantCalls      []kubeletCall
+		wantRequeue    time.Duration
+		wantPhase      tupprv1alpha1.JobPhase
+		wantJobDeleted bool
+	}{
+		{
+			name:          "without a selector tuppr leaves kubelets to upgrade-k8s",
+			ctrlVersion:   testV1330,
+			workerVersion: testV1330,
+			completedAt:   &recent,
+			wantRequeue:   10 * time.Second,
+			wantPhase:     tupprv1alpha1.JobPhaseUpgrading,
+			// Upstream behaviour: the job is replaced to try the next node.
+			wantJobDeleted: true,
+		},
+		{
+			name:          "patches lagging selected nodes, controller node first",
+			selector:      linux,
+			ctrlVersion:   testV1330,
+			workerVersion: testV1330,
+			completedAt:   &recent,
+			wantCalls: []kubeletCall{
+				{nodeIP: testNodeIP, repository: testKubeletRepo, version: testK8sVersion},
+				{nodeIP: workerIP, repository: testKubeletRepo, version: testK8sVersion},
+			},
+			wantRequeue: 15 * time.Second,
+			wantPhase:   tupprv1alpha1.JobPhaseUpgrading,
+		},
+		{
+			name:          "honours the image repository",
+			selector:      linux,
+			repository:    testImageRepo + "/",
+			ctrlVersion:   testK8sVersion,
+			workerVersion: testV1330,
+			completedAt:   &recent,
+			wantCalls: []kubeletCall{
+				{nodeIP: workerIP, repository: testImageRepo + "/kubelet", version: testK8sVersion},
+			},
+			wantRequeue: 15 * time.Second,
+			wantPhase:   tupprv1alpha1.JobPhaseUpgrading,
+		},
+		{
+			name:           "completes once every selected kubelet is at target",
+			selector:       linux,
+			ctrlVersion:    testK8sVersion,
+			workerVersion:  testK8sVersion,
+			completedAt:    &recent,
+			wantRequeue:    time.Hour,
+			wantPhase:      tupprv1alpha1.JobPhaseCompleted,
+			wantJobDeleted: false,
+		},
+		{
+			name:          "a patch error within the wait requeues",
+			selector:      linux,
+			ctrlVersion:   testV1330,
+			workerVersion: testK8sVersion,
+			completedAt:   &recent,
+			kubeletErr:    fmt.Errorf("connection refused"),
+			wantCalls: []kubeletCall{
+				{nodeIP: testNodeIP, repository: testKubeletRepo, version: testK8sVersion},
+			},
+			wantRequeue: 30 * time.Second,
+			wantPhase:   tupprv1alpha1.JobPhaseUpgrading,
+		},
+		{
+			name:          "a patch error past the wait fails the upgrade",
+			selector:      linux,
+			ctrlVersion:   testV1330,
+			workerVersion: testK8sVersion,
+			completedAt:   &stale,
+			kubeletErr:    fmt.Errorf("connection refused"),
+			wantCalls: []kubeletCall{
+				{nodeIP: testNodeIP, repository: testKubeletRepo, version: testK8sVersion},
+			},
+			wantRequeue:    10 * time.Minute,
+			wantPhase:      tupprv1alpha1.JobPhaseFailed,
+			wantJobDeleted: true,
+		},
+		{
+			name:          "a kubelet still lagging past the wait moves on",
+			selector:      linux,
+			ctrlVersion:   testV1330,
+			workerVersion: testK8sVersion,
+			completedAt:   &stale,
+			wantCalls: []kubeletCall{
+				{nodeIP: testNodeIP, repository: testKubeletRepo, version: testK8sVersion},
+			},
+			wantRequeue:    10 * time.Second,
+			wantPhase:      tupprv1alpha1.JobPhaseUpgrading,
+			wantJobDeleted: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ku := newKubernetesUpgrade("test-upgrade",
+				withK8sFinalizer,
+				withK8sPhase(tupprv1alpha1.JobPhaseUpgrading),
+				func(ku *tupprv1alpha1.KubernetesUpgrade) {
+					ku.Spec.Kubernetes.ImageRepository = tc.repository
+					ku.Status.ControllerNode = fakeCrtl
+				},
+			)
+			if tc.selector != nil {
+				withK8sNodeSelector(tc.selector)(ku)
+			}
+			job := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      testJobNameStr,
+					Namespace: testNamespace,
+					Labels: map[string]string{
+						appLabelKey:        kubernetesUpgradeAppName,
+						targetNodeLabelKey: fakeCrtl,
+					},
+				},
+				Spec:   batchv1.JobSpec{BackoffLimit: ptr.To(int32(2)), Template: corev1.PodTemplateSpec{}},
+				Status: batchv1.JobStatus{Succeeded: 1, CompletionTime: tc.completedAt},
+			}
+			objs := append(newNodes(tc.ctrlVersion, tc.workerVersion), ku, job)
+			cl := fake.NewClientBuilder().WithScheme(newTestScheme()).
+				WithObjects(objs...).WithStatusSubresource(ku).Build()
+			tc2 := &mockTalosClient{kubeletErr: tc.kubeletErr}
+			r := newK8sReconciler(cl, &mockVersionGetter{version: testK8sVersion}, tc2, &mockHealthChecker{})
+			r.Now = &fixedClock{now}
+
+			result := reconcileK8s(t, r, "test-upgrade")
+			if result.RequeueAfter != tc.wantRequeue {
+				t.Fatalf("expected %v requeue, got: %v", tc.wantRequeue, result.RequeueAfter)
+			}
+			if !slices.Equal(tc2.kubeletCalls, tc.wantCalls) {
+				t.Fatalf("kubelet calls: got %+v, want %+v", tc2.kubeletCalls, tc.wantCalls)
+			}
+			if phase := getK8sUpgrade(t, cl, "test-upgrade").Status.Phase; phase != tc.wantPhase {
+				t.Fatalf("expected phase %s, got: %s", tc.wantPhase, phase)
+			}
+			err := cl.Get(context.Background(), client.ObjectKeyFromObject(job), &batchv1.Job{})
+			if deleted := apierrors.IsNotFound(err); deleted != tc.wantJobDeleted {
+				t.Fatalf("expected job deleted=%v, got err: %v", tc.wantJobDeleted, err)
+			}
+		})
 	}
 }

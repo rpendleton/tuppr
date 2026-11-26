@@ -51,6 +51,18 @@ spec:
 The selector also limits which control plane node the upgrade runs against, so
 it has to match at least one.
 
+With a selector, kubelets are upgraded on the selected nodes only. `talosctl
+upgrade-k8s` upgrades the kubelet on every node without the control plane
+label and has no way to narrow that set, so tuppr runs it with
+`--upgrade-kubelet=false` (the control plane components, kube-proxy and the
+bootstrap manifests are still upgraded) and then sets the kubelet image on each
+selected node itself, the controller node first, as `talosctl` would: in the
+`KubeletConfig` document when the node's config has one, in
+`.machine.kubelet.image` otherwise, keeping a `-fat` or `-slim` suffix, applied
+without a reboot. The image is `ghcr.io/siderolabs/kubelet`, or
+`<spec.kubernetes.imageRepository>/kubelet` when that is set. Without a
+selector, `upgrade-k8s` upgrades every kubelet itself.
+
 ## One per cluster
 
 A Kubernetes upgrade is cluster-wide, so the admission webhook allows only one

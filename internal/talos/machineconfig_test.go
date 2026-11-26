@@ -183,3 +183,78 @@ func TestSplitDocuments(t *testing.T) {
 	docs = splitDocuments("---\n" + config114 + "\n")
 	assert.Len(t, docs, 4)
 }
+
+const testKubeletImage = "ghcr.io/siderolabs/kubelet:v1.37.3"
+
+// A config whose kubelet lives in the multi-document KubeletConfig. The node
+// rejects a .machine.kubelet section alongside it.
+const configKubeletDoc = `version: v1alpha1
+machine:
+  type: controlplane
+cluster:
+  clusterName: test
+---
+apiVersion: v1alpha1
+kind: KubeletConfig
+image: ghcr.io/siderolabs/kubelet:v1.37.0-fat # pinned
+config:
+  maxPods: 250
+---
+apiVersion: v1alpha1
+kind: BGPPeerConfig
+name: peer-1
+`
+
+func TestKubeletImage(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		set  string
+		want string // the config after setKubeletImage(raw, set)
+		old  string // kubeletImageFromConfig(raw)
+	}{
+		{
+			name: "v1alpha1 machine.kubelet.image",
+			raw:  config114,
+			old:  "ghcr.io/siderolabs/kubelet:v1.37.0",
+			set:  testKubeletImage,
+			want: strings.Replace(config114, "kubelet:v1.37.0", "kubelet:v1.37.3", 1),
+		},
+		{
+			name: "KubeletConfig document, not machine.kubelet",
+			raw:  configKubeletDoc,
+			old:  "ghcr.io/siderolabs/kubelet:v1.37.0-fat",
+			set:  "ghcr.io/siderolabs/kubelet:v1.37.3-fat",
+			want: strings.Replace(configKubeletDoc, "kubelet:v1.37.0-fat", "kubelet:v1.37.3-fat", 1),
+		},
+		{
+			name: "v1alpha1 without a kubelet section",
+			raw:  config113,
+			old:  "",
+			set:  testKubeletImage,
+			want: strings.Replace(config113, "cluster:", "  kubelet:\n    image: ghcr.io/siderolabs/kubelet:v1.37.3\ncluster:", 1),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			old, err := kubeletImageFromConfig(tc.raw)
+			require.NoError(t, err)
+			assert.Equal(t, tc.old, old)
+
+			patched, err := setKubeletImage(tc.raw, tc.set)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, patched)
+
+			got, err := kubeletImageFromConfig(patched)
+			require.NoError(t, err)
+			assert.Equal(t, tc.set, got)
+		})
+	}
+
+	t.Run("no owning document", func(t *testing.T) {
+		_, err := setKubeletImage("apiVersion: v1alpha1\nkind: BGPPeerConfig\nname: x\n", "img")
+		require.Error(t, err)
+		_, err = kubeletImageFromConfig("apiVersion: v1alpha1\nkind: BGPPeerConfig\nname: x\n")
+		require.Error(t, err)
+	})
+}

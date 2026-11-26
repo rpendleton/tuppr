@@ -62,6 +62,12 @@ func (r *Reconciler) handleJobSuccess(ctx context.Context, kubernetesUpgrade *tu
 	nodeName := job.Labels[targetNodeLabelKey]
 	targetVersion := kubernetesUpgrade.Spec.Kubernetes.Version
 
+	if kubernetesUpgrade.Spec.NodeSelector != nil {
+		if result, waiting, err := r.awaitSelectedKubelets(ctx, kubernetesUpgrade, job); waiting {
+			return result, err
+		}
+	}
+
 	allUpgraded, err := r.areAllControlPlaneNodesUpgraded(ctx, kubernetesUpgrade.Spec.NodeSelector, targetVersion)
 	if err != nil {
 		logger.Error(err, "Failed to verify Kubernetes upgrade, requeueing")
@@ -104,8 +110,16 @@ func (r *Reconciler) handleJobFailure(ctx context.Context, kubernetesUpgrade *tu
 	logger.Error(errors.New("job failed permanently"), "Kubernetes upgrade job failed",
 		"job", job.Name, "node", nodeName, "targetVersion", kubernetesUpgrade.Spec.Kubernetes.Version)
 
-	if err := r.setPhaseWithUpdates(ctx, kubernetesUpgrade, tupprv1alpha1.JobPhaseFailed, "", kubernetesUpgrade.Status.ControllerNode, "Kubernetes upgrade job failed permanently", map[string]any{
-		statusFieldLastError: "Job failed permanently",
+	return r.failJob(ctx, kubernetesUpgrade, job, "Kubernetes upgrade job failed permanently", "Job failed permanently")
+}
+
+// failJob marks the upgrade Failed with message and lastError, and removes the job.
+func (r *Reconciler) failJob(ctx context.Context, kubernetesUpgrade *tupprv1alpha1.KubernetesUpgrade, job *batchv1.Job, message, lastError string) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	nodeName := job.Labels[targetNodeLabelKey]
+
+	if err := r.setPhaseWithUpdates(ctx, kubernetesUpgrade, tupprv1alpha1.JobPhaseFailed, "", kubernetesUpgrade.Status.ControllerNode, message, map[string]any{
+		statusFieldLastError: lastError,
 		statusFieldJobName:   job.Name,
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("set Failed phase for job %s: %w", job.Name, err)
@@ -196,6 +210,7 @@ func (r *Reconciler) buildJob(ctx context.Context, kubernetesUpgrade *tupprv1alp
 		"--endpoint="+endpoint,
 	)
 	args = append(args, componentImageArgs(k8sSpec.ImageRepository)...)
+	args = append(args, upgradeKubeletArgs(kubernetesUpgrade)...)
 
 	pullPolicy := corev1.PullIfNotPresent
 	if kubernetesUpgrade.Spec.Talosctl.Image.PullPolicy != "" {

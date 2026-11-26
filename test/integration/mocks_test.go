@@ -100,6 +100,10 @@ func (m *mockTalosClient) PatchNodeInstallImage(ctx context.Context, nodeIP, new
 	return nil
 }
 
+func (m *mockTalosClient) SetNodeKubeletVersion(ctx context.Context, nodeIP, repository, version string) (bool, error) {
+	return false, nil
+}
+
 func (m *mockTalosClient) PullImage(ctx context.Context, nodeIP, imageRef string) error {
 	return nil
 }

@@ -13,6 +13,10 @@ import (
 const (
 	testK8sVersion = "v1.34.0"
 	testV110       = "v1.10.0"
+
+	testKubeletRepo = "ghcr.io/siderolabs/kubelet"
+	testImageRepo   = "registry.example.com/k8s"
+	testLinux       = "linux"
 )
 
 func TestK8sBuildJob_Properties(t *testing.T) {
@@ -180,6 +184,96 @@ func TestComponentImageArgs(t *testing.T) {
 			got := componentImageArgs(c.repository)
 			if !slices.Equal(got, c.want) {
 				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestK8sBuildJob_UpgradeKubeletArgs(t *testing.T) {
+	cases := []struct {
+		name         string
+		nodeSelector map[string]string
+		repository   string
+		want         []string
+	}{
+		{
+			name: "without a selector talosctl upgrades every kubelet",
+			want: []string{
+				upgradeK8sCommand,
+				"--endpoints=" + testNodeIP,
+				"--nodes=" + testNodeIP,
+				"--to=" + testK8sVersion,
+				"--endpoint=" + defaultKubernetesAPIEndpoint,
+			},
+		},
+		{
+			name:         "a selector leaves kubelets to the controller",
+			nodeSelector: map[string]string{corev1.LabelOSStable: testLinux},
+			want: []string{
+				upgradeK8sCommand,
+				"--endpoints=" + testNodeIP,
+				"--nodes=" + testNodeIP,
+				"--to=" + testK8sVersion,
+				"--endpoint=" + defaultKubernetesAPIEndpoint,
+				"--upgrade-kubelet=false",
+			},
+		},
+		{
+			name:         "a selector with an image repository",
+			nodeSelector: map[string]string{corev1.LabelOSStable: testLinux},
+			repository:   testImageRepo,
+			want: []string{
+				upgradeK8sCommand,
+				"--endpoints=" + testNodeIP,
+				"--nodes=" + testNodeIP,
+				"--to=" + testK8sVersion,
+				"--endpoint=" + defaultKubernetesAPIEndpoint,
+				"--apiserver-image=" + testImageRepo + "/kube-apiserver",
+				"--controller-manager-image=" + testImageRepo + "/kube-controller-manager",
+				"--scheduler-image=" + testImageRepo + "/kube-scheduler",
+				"--proxy-image=" + testImageRepo + "/kube-proxy",
+				"--kubelet-image=" + testImageRepo + "/kubelet",
+				"--upgrade-kubelet=false",
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ku := newKubernetesUpgrade("test-upgrade", withK8sFinalizer)
+			ku.Spec.Kubernetes.ImageRepository = c.repository
+			if c.nodeSelector != nil {
+				withK8sNodeSelector(c.nodeSelector)(ku)
+			}
+			tc := &mockTalosClient{nodeVersions: map[string]string{testNodeIP: testV110}}
+			cl := fake.NewClientBuilder().WithScheme(newTestScheme()).
+				WithObjects(ku, newControllerNode(fakeCrtl, testNodeIP)).WithStatusSubresource(ku).Build()
+			r := newK8sReconciler(cl, &mockVersionGetter{}, tc, &mockHealthChecker{})
+
+			job, err := r.buildJob(context.Background(), ku, fakeCrtl, testNodeIP)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := job.Spec.Template.Spec.Containers[0].Args; !slices.Equal(got, c.want) {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestKubeletImageRepository(t *testing.T) {
+	cases := []struct {
+		name       string
+		repository string
+		want       string
+	}{
+		{name: "talos default", repository: "", want: testKubeletRepo},
+		{name: "image repository", repository: testImageRepo, want: testImageRepo + "/kubelet"},
+		{name: "trailing slash trimmed", repository: testImageRepo + "/", want: testImageRepo + "/kubelet"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := kubeletImageRepository(c.repository); got != c.want {
+				t.Fatalf("got %q, want %q", got, c.want)
 			}
 		})
 	}

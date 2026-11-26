@@ -63,6 +63,7 @@ const (
 // TalosClient defines the interface for Talos operations
 type TalosClient interface {
 	GetNodeVersion(ctx context.Context, nodeIP string) (string, error)
+	SetNodeKubeletVersion(ctx context.Context, nodeIP, repository, version string) (bool, error)
 }
 
 // HealthCheckRunner defines the interface for health checking
